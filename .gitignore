@@ -1,0 +1,19 @@
+# 1. Ignore everything by default
+*
+
+# 2. Allow Git to traverse directories (required to find the whitelisted files)
+!*/
+
+# 3. Explicitly re-ignore directories we NEVER want Git to look inside
+.venv/
+__pycache__/
+.ruff_cache/
+.git/
+
+# 4. Whitelist the specific files you want to track
+!.gitignore
+!*.py
+!README.md
+!.pre-commit-config.yaml
+!pyproject.toml
+!requirements.txt
