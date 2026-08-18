@@ -7,15 +7,20 @@ at a specific moment in time.
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from typing import Optional
+
+import numpy as np
 
 
 @dataclass
 class OptionContract:
-    """A single option quote, snapshotted at a moment in time."""
+    """A single option quote, snapshotted at a moment in time.
+
+    All price-like fields may be None if the source didn't provide them
+    (e.g. an illiquid strike with no bid/ask).
+    """
 
     contract_symbol: str
     underlying: str
@@ -41,8 +46,12 @@ class OptionContract:
         else:
             raise ValueError(f"option_type must be call/put, got {self.option_type!r}")
 
-    # Derived quantities ------------------------------------------------------------------
+        if self.snapshot_time.tzinfo is None:
+            self.snapshot_time = self.snapshot_time.replace(tzinfo=timezone.utc)
 
+    # ------------------------------------------------------------------
+    # Derived quantities
+    # ------------------------------------------------------------------
     @property
     def is_call(self) -> bool:
         return self.option_type == "call"
@@ -71,16 +80,53 @@ class OptionContract:
 
     @property
     def spread_pct(self) -> Optional[float]:
-        """Spread as a fraction of mid price."""
+        """Spread as a fraction of mid price -- useful for filtering junk quotes."""
         mid = self.mid_price
         sp = self.spread
-        if mid is not None and sp is not None and mid > 0:
+        if mid and sp is not None and mid > 0:
             return sp / mid
         return None
 
     @property
+    def invalid_reason(self) -> Optional[str]:
+        """Why this quote looks corrupted/unusable, or None if it looks fine.
+
+        Deliberately a property that reports a reason rather than an
+        exception raised in __post_init__: one bad row (a crossed market, a
+        stale zero price) should not abort loading an entire chain of
+        otherwise-good contracts. Callers decide what to do with invalid
+        contracts -- OptionsChain.filter() drops them by default.
+        """
+        if self.strike <= 0:
+            return "non-positive strike"
+        if self.underlying_price <= 0:
+            return "non-positive underlying price"
+        if self.bid is not None and self.bid < 0:
+            return "negative bid"
+        if self.ask is not None and self.ask < 0:
+            return "negative ask"
+        if (
+            self.bid is not None
+            and self.ask is not None
+            and self.bid > 0
+            and self.ask > 0
+            and self.bid > self.ask
+        ):
+            return "crossed market (bid > ask)"
+        if (self.expiry - self.snapshot_time.date()).days < 0:
+            return "already expired as of snapshot_time"
+        if self.implied_vol is not None and self.implied_vol < 0:
+            return "negative implied vol"
+        return None
+
+    @property
+    def is_valid(self) -> bool:
+        return self.invalid_reason is None
+
+    @property
     def time_to_expiry(self) -> float:
-        """Time to expiry in years (ACT/365)."""
+        """Time to expiry in years (ACT/365), floored at a tiny positive number
+        so log/divide operations never blow up on expiry day."""
         days = (self.expiry - self.snapshot_time.date()).days
         return max(days, 0) / 365.0 + 1e-6
 
@@ -91,8 +137,8 @@ class OptionContract:
 
     @property
     def log_moneyness(self) -> float:
-        """ln(K / S), representing the x-coordinate for a vol surface."""
-        return math.log(self.strike / self.underlying_price)
+        """ln(K / S) -- the standard x-coordinate for a vol surface."""
+        return float(np.log(self.strike / self.underlying_price))
 
     def to_dict(self) -> dict:
         return {
@@ -112,7 +158,7 @@ class OptionContract:
         }
 
     @classmethod
-    def from_dict(cls, d: dict) -> OptionContract:
+    def from_dict(cls, d: dict) -> "OptionContract":
         d = dict(d)
         d["expiry"] = (
             date.fromisoformat(d["expiry"])
