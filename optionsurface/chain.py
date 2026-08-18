@@ -7,199 +7,160 @@ at a specific moment in time.
 
 from __future__ import annotations
 
-from datetime import date, datetime
-from typing import Iterable, List, Optional
+from dataclasses import dataclass
+from datetime import date, datetime, timezone
+from typing import Optional
 
-import pandas as pd
-import yfinance as yf
-
-from .contract import OptionContract
+import numpy as np
 
 
-class OptionsChain:
-    """A snapshot of every listed option contract for one underlying."""
+@dataclass
+class OptionContract:
+    """A single option quote, snapshotted at a moment in time.
 
-    def __init__(
-        self, underlying: str, snapshot_time: datetime, contracts: List[OptionContract]
-    ):
-        self.underlying = underlying
-        self.snapshot_time = snapshot_time
-        self.contracts = contracts
+    All price-like fields may be None if the source didn't provide them
+    (e.g. an illiquid strike with no bid/ask).
+    """
 
-    # Construction ------------------------------------------------------------------------------------------------
+    contract_symbol: str
+    underlying: str
+    underlying_price: float
+    strike: float
+    expiry: date
+    option_type: str
+    snapshot_time: datetime
 
-    @classmethod
-    def from_yfinance(
-        cls, ticker_symbol: str, max_expiries: Optional[int] = None
-    ) -> "OptionsChain":
-        """Pulls a live snapshot from Yahoo Finance via the yfinance package."""
-        tk = yf.Ticker(ticker_symbol)
-        snapshot_time = datetime.now()
-        underlying_price = cls._get_underlying_price(tk)
+    bid: Optional[float] = None
+    ask: Optional[float] = None
+    last_price: Optional[float] = None
+    volume: Optional[float] = None
+    open_interest: Optional[float] = None
+    implied_vol: Optional[float] = None
 
-        expiries = list(tk.options)
-        if max_expiries is not None:
-            expiries = expiries[:max_expiries]
-        if not expiries:
-            raise ValueError(f"No listed option expiries found for {ticker_symbol!r}")
+    def __post_init__(self) -> None:
+        ot = self.option_type.lower().strip()
+        if ot in ("call", "c"):
+            self.option_type = "call"
+        elif ot in ("put", "p"):
+            self.option_type = "put"
+        else:
+            raise ValueError(f"option_type must be call/put, got {self.option_type!r}")
 
-        contracts: List[OptionContract] = []
-        for expiry_str in expiries:
-            expiry = datetime.strptime(expiry_str, "%Y-%m-%d").date()
-            try:
-                oc = tk.option_chain(expiry_str)
-            except Exception:
-                continue
+        if self.snapshot_time.tzinfo is None:
+            self.snapshot_time = self.snapshot_time.replace(tzinfo=timezone.utc)
 
-            contracts.extend(
-                cls._rows_to_contracts(
-                    oc.calls,
-                    "call",
-                    ticker_symbol,
-                    underlying_price,
-                    expiry,
-                    snapshot_time,
-                )
-            )
-            contracts.extend(
-                cls._rows_to_contracts(
-                    oc.puts,
-                    "put",
-                    ticker_symbol,
-                    underlying_price,
-                    expiry,
-                    snapshot_time,
-                )
-            )
+    # ------------------------------------------------------------------
+    # Derived quantities
+    # ------------------------------------------------------------------
+    @property
+    def is_call(self) -> bool:
+        return self.option_type == "call"
 
-        return cls(ticker_symbol, snapshot_time, contracts)
+    @property
+    def is_put(self) -> bool:
+        return self.option_type == "put"
 
-    @staticmethod
-    def _get_underlying_price(tk: yf.Ticker) -> float:
-        for attr, key in (("fast_info", "last_price"), ("info", "regularMarketPrice")):
-            try:
-                obj = getattr(tk, attr)
-                # Fixed typo: __gititem__ -> __getitem__
-                val = obj[key] if hasattr(obj, "__getitem__") else getattr(obj, key)
-                if val:
-                    return float(val)
-            except Exception:
-                continue
+    @property
+    def mid_price(self) -> Optional[float]:
+        """Bid/ask midpoint, falling back to last trade price."""
+        if (
+            self.bid is not None
+            and self.ask is not None
+            and self.bid > 0
+            and self.ask > 0
+        ):
+            return (self.bid + self.ask) / 2.0
+        return self.last_price
 
-        hist = tk.history(period="1d")
-        if not hist.empty:
-            return float(hist["Close"].iloc[-1])
-        raise ValueError(f"Could not determine underlying price for {tk.ticker}")
-
-    @classmethod
-    def _rows_to_contracts(
-        cls,
-        df: pd.DataFrame,
-        option_type: str,
-        underlying: str,
-        underlying_price: float,
-        expiry: date,
-        snapshot_time: datetime,
-    ) -> List[OptionContract]:
-        out = []
-        for _, row in df.iterrows():
-            out.append(
-                OptionContract(
-                    contract_symbol=row.get("contractSymbol", ""),
-                    underlying=underlying,
-                    underlying_price=underlying_price,
-                    strike=float(row["strike"]),
-                    expiry=expiry,
-                    option_type=option_type,
-                    snapshot_time=snapshot_time,
-                    # Added cls. prefix for _safe_float
-                    bid=cls._safe_float(row.get("bid")),
-                    ask=cls._safe_float(row.get("ask")),
-                    last_price=cls._safe_float(row.get("lastPrice")),
-                    volume=cls._safe_float(row.get("volume")),
-                    open_interest=cls._safe_float(row.get("openInterest")),
-                    implied_vol=cls._safe_float(row.get("impliedVolatility")),
-                )
-            )
-        return out
-
-    @classmethod
-    def from_contracts(
-        cls,
-        underlying: str,
-        snapshot_time: datetime,
-        contracts: Iterable[OptionContract],
-    ) -> "OptionsChain":
-        return cls(underlying, snapshot_time, list(contracts))
-
-    # Access / filtering ------------------------------------------------------------------------------------------
-
-    def calls(self) -> List[OptionContract]:
-        return [c for c in self.contracts if c.is_call]
-
-    def puts(self) -> List[OptionContract]:
-        return [c for c in self.contracts if c.is_put]
-
-    def expiries(self) -> List[date]:
-        return sorted({c.expiry for c in self.contracts})
-
-    def filter(
-        self,
-        option_type: Optional[str] = None,
-        min_volume: Optional[float] = None,
-        min_open_interest: Optional[float] = None,
-        max_spread_pct: Optional[float] = None,
-        require_iv: bool = True,
-    ) -> "OptionsChain":
-        """Return a new OptionsChain with only contracts passing the given filters."""
-        kept = []
-        for c in self.contracts:
-            if option_type is not None and c.option_type != option_type:
-                continue
-            if require_iv and (c.implied_vol is None or c.implied_vol <= 0):
-                continue
-            if min_volume is not None and (c.volume or 0) < min_volume:
-                continue
-            if (
-                min_open_interest is not None
-                and (c.open_interest or 0) < min_open_interest
-            ):
-                continue
-            if max_spread_pct is not None:
-                sp = c.spread_pct
-                if sp is None or sp > max_spread_pct:
-                    continue
-            kept.append(c)
-        return OptionsChain(self.underlying, self.snapshot_time, kept)
-
-    # Conversion --------------------------------------------------------------------------------------------------
-
-    def to_dataframe(self) -> pd.DataFrame:
-        return pd.DataFrame([c.to_dict() for c in self.contracts])
-
-    @classmethod
-    def from_dataframe(
-        cls, df: pd.DataFrame, underlying: str, snapshot_time: datetime
-    ) -> "OptionsChain":
-        contracts = [
-            OptionContract.from_dict(row) for row in df.to_dict(orient="records")
-        ]
-        return cls(underlying, snapshot_time, contracts)
-
-    def __len__(self) -> int:
-        return len(self.contracts)
-
-    def __repr__(self) -> str:
-        return (
-            f"OptionsChain(underlying={self.underlying!r}, "
-            f"snapshot_time={self.snapshot_time!r}, n_contracts={len(self)})"
-        )
-
-
-def _safe_float(x) -> Optional[float]:
-    try:
-        if x is None or (isinstance(x, float) and pd.isna(x)):
-            return None
-        return float(x)
-    except (TypeError, ValueError):
+    @property
+    def spread(self) -> Optional[float]:
+        if self.bid is not None and self.ask is not None:
+            return self.ask - self.bid
         return None
+
+    @property
+    def spread_pct(self) -> Optional[float]:
+        """Spread as a fraction of mid price -- useful for filtering junk quotes."""
+        mid = self.mid_price
+        sp = self.spread
+        if mid and sp is not None and mid > 0:
+            return sp / mid
+        return None
+
+    @property
+    def invalid_reason(self) -> Optional[str]:
+        """Why this quote looks corrupted/unusable, or None if it looks fine."""
+        if self.strike <= 0:
+            return "non-positive strike"
+        if self.underlying_price <= 0:
+            return "non-positive underlying price"
+        if self.bid is not None and self.bid < 0:
+            return "negative bid"
+        if self.ask is not None and self.ask < 0:
+            return "negative ask"
+        if (
+            self.bid is not None
+            and self.ask is not None
+            and self.bid > 0
+            and self.ask > 0
+            and self.bid > self.ask
+        ):
+            return "crossed market (bid > ask)"
+        if (self.expiry - self.snapshot_time.date()).days < 0:
+            return "already expired as of snapshot_time"
+        if self.implied_vol is not None and self.implied_vol < 0:
+            return "negative implied vol"
+        return None
+
+    @property
+    def is_valid(self) -> bool:
+        return self.invalid_reason is None
+
+    @property
+    def time_to_expiry(self) -> float:
+        """Time to expiry in years (ACT/365), floored at a tiny positive number
+        so log/divide operations never blow up on expiry day."""
+        days = (self.expiry - self.snapshot_time.date()).days
+        return max(days, 0) / 365.0 + 1e-6
+
+    @property
+    def moneyness(self) -> float:
+        """K / S"""
+        return self.strike / self.underlying_price
+
+    @property
+    def log_moneyness(self) -> float:
+        """ln(K / S) -- the standard x-coordinate for a vol surface."""
+        return float(np.log(self.strike / self.underlying_price))
+
+    def to_dict(self) -> dict:
+        return {
+            "contract_symbol": self.contract_symbol,
+            "underlying": self.underlying,
+            "underlying_price": self.underlying_price,
+            "strike": self.strike,
+            "expiry": self.expiry.isoformat(),
+            "option_type": self.option_type,
+            "snapshot_time": self.snapshot_time.isoformat(),
+            "bid": self.bid,
+            "ask": self.ask,
+            "last_price": self.last_price,
+            "volume": self.volume,
+            "open_interest": self.open_interest,
+            "implied_vol": self.implied_vol,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "OptionContract":
+        d = dict(d)
+        d["expiry"] = (
+            date.fromisoformat(d["expiry"])
+            if isinstance(d["expiry"], str)
+            else d["expiry"]
+        )
+        d["snapshot_time"] = (
+            datetime.fromisoformat(d["snapshot_time"])
+            if isinstance(d["snapshot_time"], str)
+            else d["snapshot_time"]
+        )
+        return cls(**d)
