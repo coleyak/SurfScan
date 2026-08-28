@@ -13,6 +13,8 @@ __pycache__/
 # 4. Whitelist the specific files you want to track
 !.gitignore
 !*.py
+!*.sh
+!*.ps1
 !README.md
 !.pre-commit-config.yaml
 !pyproject.toml
